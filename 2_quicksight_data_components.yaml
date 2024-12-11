@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Visualize Amazon WorkSpaces Utilization with Amazon QuickSight - 2 QuickSight Data Components
+
+Mappings:
+  Options:
+    global:
+      QuickSightDataSourceName: WorkSpaces-CostOptimizer-Data-Source
+      WorkSpacesManifestJsonFileName: workspaces.json
+
+Parameters:
+  WorkSpacesDataBucketName:
+    Type: String
+    Description: The name of the S3 bucket containing the WorkSpaces utilization data
+  QuickSightUserName:
+    Type: String
+    Description: The username of the Amazon QuickSight user who will create QuickSight content.
+  QuickSightNamespace:
+    Type: String
+    Description: The name of the QuickSight namespace. It most cases, it is `default`.
+    Default: default
+  QuickSightDatasetName:
+    Type: String
+    Description: The name to use for the QuickSight dataset.
+    Default: WorkSpaces-CostOptimizer-Dataset
+  QuickSightDataSourceName:
+    Type: String
+    Description: The name to use for the QuickSight data source.
+    Default: WorkSpaces-CostOptimizer-Data-Source
+
+Resources:
+
+  cfnGetQuickSightArns:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "The Lambda function does not need access to resources in a VPC."
+      #checkov:skip=CKV_AWS_116: The Lambda function does not need a Dead Letter Queue (DLQ).
+      #checkov:skip=CKV_AWS_117: The Lambda function does not need access to resources in a VPC.
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt GetQuickSightArnsExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          from botocore.exceptions import ClientError
+          import cfnresponse
+
+          def lambda_handler(event, context):
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            logger.info("Received event: %s", event)
+
+            if event['RequestType'] == 'Delete':
+              logger.info("Delete event detected.")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Delete event detected."})
+              return
+            
+            try:
+              aws_account_id = event['ResourceProperties']['AwsAccountId']
+              username = event['ResourceProperties']['UserName']
+              namespace = event['ResourceProperties']['Namespace']
+              region = event['ResourceProperties']['Region']
+            
+              quicksight = boto3.client('quicksight', region_name = region)
+
+              logger.info(f"Getting QuickSight ARNs for AWS account ID: {aws_account_id}, namespace: {namespace}, region: {region}, and username: {username}")
+    
+              users = quicksight.list_users(AwsAccountId=aws_account_id, Namespace=namespace)
+    
+              logger.info(f"Found users: {len(users['UserList'])}")
+              
+              quicksight_user_arn = None
+              
+              for user in users['UserList']:
+                logger.info(f"- Name: {user['UserName']}, ARN: {user['Arn']}")
+                if user['UserName'] == username:
+                  quicksight_user_arn = user['Arn']
+                  logger.info(f"Found user '{username}' in AWS account {aws_account_id}, namespace '{namespace}', and region '{region}'. ARN: {quicksight_user_arn}")
+                  break
+              
+              if quicksight_user_arn is None:
+                logger.error(f"User '{username}' not found in AWS account {aws_account_id}, namespace '{namespace}', and region '{region}'")
+                  
+              logger.info(f"QuickSight User ARN: '{quicksight_user_arn}'")
+                
+              if not quicksight_user_arn:
+                raise ClientError({'Error': {'Code': 'ResourceNotFoundException', 'Message': f"Could not find QuickSight user name '{username}' in AWS account '{aws_account_id}', namespace '{namespace}', region '{region}'."}}, 'list_users')
+
+              quicksight_arn = quicksight_user_arn.split(f":user/{namespace}")[0]
+              logger.info(f"Quicksight ARN: {quicksight_arn}")
+        
+              quicksight_region = region
+              logger.info(f"Quicksight Region: {quicksight_region}")
+
+              logger.info(f"Returning QuickSightUserArn: {quicksight_user_arn}, QuickSightArn: {quicksight_arn}, QuickSightRegion: {quicksight_region}")
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'QuickSightUserArn': quicksight_user_arn, 'QuickSightArn': quicksight_arn, 'QuickSightRegion': quicksight_region})
+            except ClientError as e:
+              if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                  logger.error(f"Please verify the correct AWS Region, QuickSight Namespace, and QuickSight Username: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+              else:
+                  logger.error(f"Unexpected ClientError: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+            except Exception as e:
+              logger.error(f"Unexpected error: {str(e)}")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Runtime: python3.12
+      Timeout: 15
+      ReservedConcurrentExecutions: 1
+
+  GetQuickSightArnsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: QuickSightReadOnlyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "quicksight:ListNamespaces"
+                  - "quicksight:ListUsers"
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:quicksight:*:${AWS::AccountId}:namespace/*"
+                  - !Sub "arn:${AWS::Partition}:quicksight:*:${AWS::AccountId}:user/*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  InvokeCfnGetQuickSightArns:
+    Type: Custom::GetUserArn
+    Properties:
+      ServiceToken: !GetAtt cfnGetQuickSightArns.Arn
+      AwsAccountId: !Ref AWS::AccountId
+      UserName: !Ref QuickSightUserName
+      Namespace: !Ref QuickSightNamespace
+      Region: !Ref AWS::Region
+
+  WorkSpacesQuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      DataSourceId: !Ref QuickSightDataSourceName
+      AwsAccountId: !Ref AWS::AccountId
+      Name: !Ref QuickSightDataSourceName
+      Type: S3
+      DataSourceParameters:
+        S3Parameters:
+          ManifestFileLocation:
+            Bucket: !Ref WorkSpacesDataBucketName
+            Key: !FindInMap [Options, global, WorkSpacesManifestJsonFileName]
+      Permissions:
+      - Principal: !GetAtt InvokeCfnGetQuickSightArns.QuickSightUserArn
+        Actions:
+          - quicksight:PassDataSource
+          - quicksight:DescribeDataSourcePermissions
+          - quicksight:UpdateDataSource
+          - quicksight:UpdateDataSourcePermissions
+          - quicksight:DescribeDataSource
+          - quicksight:DeleteDataSource
+
+  WorkSpacesQuickSightDataset:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      DataSetId: !Ref QuickSightDatasetName
+      AwsAccountId: !Ref AWS::AccountId
+      Name: !Ref QuickSightDatasetName
+      Permissions:
+        - Principal: !GetAtt InvokeCfnGetQuickSightArns.QuickSightUserArn
+          Actions:
+            - quicksight:DeleteDataSet
+            - quicksight:UpdateDataSetPermissions
+            - quicksight:PutDataSetRefreshProperties
+            - quicksight:CreateRefreshSchedule
+            - quicksight:CancelIngestion
+            - quicksight:UpdateRefreshSchedule
+            - quicksight:DeleteRefreshSchedule
+            - quicksight:ListRefreshSchedules
+            - quicksight:PassDataSet
+            - quicksight:DescribeDataSetRefreshProperties
+            - quicksight:DescribeDataSet
+            - quicksight:CreateIngestion
+            - quicksight:DescribeRefreshSchedule
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:DeleteDataSetRefreshProperties
+            - quicksight:DescribeIngestion
+      PhysicalTableMap:
+        PhysicalTable1:
+          S3Source:
+            DataSourceArn: !GetAtt WorkSpacesQuickSightDataSource.Arn
+            UploadSettings:
+              Format: CSV
+              StartFromRow: 1
+              ContainsHeader: true
+              TextQualifier: DOUBLE_QUOTE
+              Delimiter: ','
+            InputColumns:
+              - Name: WorkSpaceID
+                Type: STRING
+              - Name: 'Billable Hours'
+                Type: STRING
+              - Name: "Usage Threshold"
+                Type: STRING
+              - Name: "Change Reported"
+                Type: STRING
+              - Name: "Bundle Type"
+                Type: STRING
+              - Name: "Initial Mode"
+                Type: STRING
+              - Name: "New Mode"
+                Type: STRING
+              - Name: Username
+                Type: STRING
+              - Name: "Computer Name"
+                Type: STRING
+              - Name: DirectoryId
+                Type: STRING
+              - Name: WorkspaceTerminated
+                Type: STRING
+              - Name: Tags
+                Type: STRING
+              - Name: ReportDate
+                Type: STRING
+      LogicalTableMap:
+        LogicalTable1:
+          Alias: WorkSpaces
+          Source:
+            PhysicalTableId: PhysicalTable1
+          DataTransforms:
+            - CastColumnTypeOperation:
+                ColumnName: "Billable Hours"
+                NewColumnType: INTEGER
+            - CastColumnTypeOperation:
+                ColumnName: ReportDate
+                NewColumnType: DATETIME
+                Format: MM/dd/yy
+            - CastColumnTypeOperation:
+                ColumnName: "Usage Threshold"
+                NewColumnType: INTEGER
+      OutputColumns:
+        - Name: WorkspaceID
+          Type: STRING
+        - Name: "Billable Hours"
+          Type: INTEGER
+        - Name: "Usage Threshold"
+          Type: INTEGER
+        - Name: "Change Reported"
+          Type: STRING
+        - Name: "Bundle Type"
+          Type: STRING
+        - Name: "Initial Mode"
+          Type: STRING
+        - Name: "New Mode"
+          Type: STRING
+        - Name: Username
+          Type: STRING
+        - Name: "Computer Name"
+          Type: STRING
+        - Name: DirectoryId
+          Type: STRING
+        - Name: WorkspaceTerminated
+          Type: STRING
+        - Name: Tags
+          Type: STRING
+        - Name: ReportDate
+          Type: DATETIME
+      ImportMode: SPICE    
+
+  cfnCreateQsDataSetRefreshSchedule:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "The Lambda function does not need access to resources in a VPC."
+      ##checkov:skip=CKV_AWS_116: The Lambda function does not need a Dead Letter Queue (DLQ).
+      #checkov:skip=CKV_AWS_117: The Lambda function does not need access to resources in a VPC.
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateQsDataSetRefreshScheduleExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+          import uuid
+          from datetime import datetime, timezone, timedelta
+
+          def lambda_handler(event, context):
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            logger.info("Received event: %s", event)
+
+            if event['RequestType'] == 'Delete':
+              logger.info("Delete event detected.")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Delete event detected."})
+              return
+
+            today = datetime.now(timezone.utc)
+            logger.debug(f"Today: {today}")
+
+            start_after_datetime = today.replace(hour=23, minute=30, second=0, microsecond=0)
+            
+            if start_after_datetime < today:
+              start_after_datetime = start_after_datetime + timedelta(days=1)
+
+            logger.debug(f"StartAfterDateTime: {start_after_datetime}")
+
+            quicksight_region = event['ResourceProperties']['QuickSightRegion']
+            logger.info(f"QuickSightRegion: {quicksight_region}")
+
+            aws_account_id = event['ResourceProperties']['AwsAccountId']
+            logger.debug(f"AwsAccountId: {aws_account_id}")
+
+            data_set_id = event['ResourceProperties']['DataSetId']
+            logger.debug(f"DataSetId: {data_set_id}")
+
+            data_set_name = data_set_id.split("|")[1]
+            logger.debug(f"DatasetName: {data_set_name}")
+
+            schedule_id = str(uuid.uuid4())
+            logger.debug(f"ScheduleId: {schedule_id}")
+
+            schedule = {
+              "ScheduleId": schedule_id,
+                "ScheduleFrequency":{
+                  "Interval": "DAILY",
+                  "Timezone": "UTC",
+                  "TimeOfTheDay": "23:30"
+                },
+                "StartAfterDateTime": start_after_datetime.isoformat(),
+                "RefreshType": "FULL_REFRESH"
+            }
+            logger.debug(f"Schedule: {schedule}")
+
+            quicksight = boto3.client("quicksight", region_name = quicksight_region)
+              
+            try:
+              logger.info(f"Creating refresh schedule for dataset '{data_set_name}' in account '{aws_account_id}': {schedule}")
+              
+              quicksight.create_refresh_schedule(DataSetId=data_set_name, AwsAccountId=aws_account_id, Schedule=schedule)
+              
+              logger.info("Successfully created refresh schedule.")
+                
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Successfully created refresh schedule."})
+            except Exception as e:
+              logger.error("Error creating refresh schedule: %s", e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": f"Error creating refresh schedule: {str(e)}, Event: {json.dumps(event)}"})
+      Runtime: python3.12
+      Timeout: 15
+      ReservedConcurrentExecutions: 1
+
+  CreateQsDataSetRefreshScheduleExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*"
+        - PolicyName: QuickSightDataSetRefreshSchedulePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "quicksight:CreateRefreshSchedule"
+                  - "quicksight:UpdateRefreshSchedule"
+                  - "quicksight:DeleteRefreshSchedule"
+                Resource:
+                  - !Sub "${InvokeCfnGetQuickSightArns.QuickSightArn}:dataset/${QuickSightDatasetName}"
+                  - !Sub "${InvokeCfnGetQuickSightArns.QuickSightArn}:dataset/${QuickSightDatasetName}/refresh-schedule/*"
+          
+  InvokeCfnCreateQsDataSetRefreshSchedule:
+    Type: Custom::InvokeLambda
+    Properties:
+      ServiceToken: !GetAtt cfnCreateQsDataSetRefreshSchedule.Arn
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Ref WorkSpacesQuickSightDataset
+      QuickSightRegion: !GetAtt InvokeCfnGetQuickSightArns.QuickSightRegion
+
+Outputs:
+  QuickSightDataSourceId:
+    Description: ID of the WorkSpaces QuickSight datasource
+    Value: !Ref WorkSpacesQuickSightDataSource
+  QuickSightDataSetId:
+    Description: ID of the WorkSpaces QuickSight datasource
+    Value: !Ref WorkSpacesQuickSightDataset

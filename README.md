@@ -4,7 +4,7 @@
 
 This solution provides a comprehensive guide to visualizing Amazon WorkSpaces utilization data using Amazon QuickSight. It helps customers gain insights into billable hours, running modes, bundle types, and AWS regions, enabling cost optimization and better efficiency.
 
-![Architecture diagram](/images/Figure1e.png "Architecture")
+![Architecture Diagram](/images/Figure1.png "Architecture")
 
 ## Features
 
